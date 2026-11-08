@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="GhostCam">
+<title>GhostCam</title>
+<style>
+:root{--fg:#f2f2f2;--mut:#8b8b8b;--acc:#ffd23f;--line:#2a2a2a;--chip:#141414}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#000;color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:14px;overflow:hidden;user-select:none;-webkit-user-select:none;touch-action:manipulation;overscroll-behavior:none}
+button{font:inherit;color:inherit;cursor:pointer}
+#app{position:fixed;inset:0;display:flex;flex-direction:column;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+
+/* header */
+header{display:flex;gap:6px;align-items:center;padding:8px 10px}
+header .sp{flex:1}
+.chip{height:34px;min-width:34px;padding:0 11px;border-radius:17px;border:1px solid var(--line);background:var(--chip);font-size:12px;font-weight:600;letter-spacing:.02em;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#000}
+.chip svg{width:18px;height:18px}
+
+/* viewfinder */
+#stage{flex:1;position:relative;min-height:0}
+#vf{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);overflow:hidden;background:#050505;border-radius:4px;touch-action:none}
+#video{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;background:#000}
+#video.mirror{transform:scaleX(-1)}
+#ghost{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;pointer-events:none;display:none;will-change:transform,opacity}
+#ghost.peek{visibility:hidden}
+.gl{position:absolute;background:rgba(255,255,255,.28);pointer-events:none}
+.gl.v{top:0;bottom:0;width:1px}.gl.h{left:0;right:0;height:1px}
+#grid{position:absolute;inset:0;pointer-events:none}
+#edge{position:absolute;pointer-events:none;display:none;border:0 dashed var(--acc)}
+#edge.v{top:0;bottom:0;width:0;border-left-width:2px}
+#edge.h{left:0;right:0;height:0;border-top-width:2px}
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .25s}
+#flash.go{opacity:.75;transition:none}
+#badge{position:absolute;left:8px;top:8px;padding:4px 8px;border-radius:10px;background:rgba(0,0,0,.55);font-size:11px;font-weight:600;pointer-events:none;display:none}
+#msg{position:absolute;inset:0;display:none;flex-direction:column;gap:14px;align-items:center;justify-content:center;text-align:center;padding:24px;color:var(--mut);line-height:1.45}
+#msg b{color:var(--fg)}
+
+/* bottom panel */
+#panel{padding:8px 14px 10px;display:flex;flex-direction:column;gap:8px}
+.seg{display:flex;background:var(--chip);border:1px solid var(--line);border-radius:10px;padding:3px;gap:3px}
+.seg button{flex:1;height:32px;border:0;border-radius:7px;background:transparent;font-size:15px;font-weight:600;color:var(--mut)}
+.seg button.on{background:#2b2b2b;color:var(--fg)}
+.seg button[data-mode=full]{font-size:12px}
+.row{display:flex;align-items:center;gap:10px;height:26px}
+.row label{width:62px;font-size:12px;color:var(--mut)}
+.row output{width:40px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums}
+input[type=range]{flex:1;-webkit-appearance:none;appearance:none;height:26px;background:transparent}
+input[type=range]::-webkit-slider-runnable-track{height:3px;background:#333;border-radius:2px}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:var(--fg);margin-top:-8.5px}
+input[type=range]::-moz-range-track{height:3px;background:#333;border-radius:2px}
+input[type=range]::-moz-range-thumb{width:20px;height:20px;border:0;border-radius:50%;background:var(--fg)}
+.ctl{display:flex;align-items:center;justify-content:space-between;padding:4px 10px 0}
+.side{width:52px;height:52px;border-radius:12px;border:1px solid var(--line);background:var(--chip);display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;padding:0}
+.side svg{width:24px;height:24px}
+.side img{width:100%;height:100%;object-fit:cover;display:none}
+#count{position:absolute;right:3px;bottom:3px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--acc);color:#000;font-size:11px;font-weight:700;display:none;align-items:center;justify-content:center}
+#shutter{width:74px;height:74px;border-radius:50%;border:4px solid #fff;background:transparent;padding:5px}
+#shutter::after{content:"";display:block;width:100%;height:100%;border-radius:50%;background:#fff;transition:transform .08s}
+#shutter:active::after{transform:scale(.88)}
+
+/* sheets */
+.sheet{position:fixed;inset:0;background:rgba(0,0,0,.96);display:none;flex-direction:column;z-index:10;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+.sheet.open{display:flex}
+.sh-head,.sh-foot{display:flex;align-items:center;gap:8px;padding:10px 12px}
+.sh-head b{font-size:16px}.sh-head .sp,.sh-foot .sp{flex:1}
+.sh-body{flex:1;overflow:auto;padding:4px 12px 12px;-webkit-overflow-scrolling:touch}
+#list{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.item{background:var(--chip);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.item.ref{border-color:var(--acc)}
+.item img{display:block;width:100%;aspect-ratio:1;object-fit:cover;background:#000}
+.item .meta{padding:6px 8px;font-size:11px;color:var(--mut);display:flex;justify-content:space-between}
+.item .acts{display:flex;border-top:1px solid var(--line)}
+.item .acts button{flex:1;height:34px;border:0;background:transparent;font-size:12px;font-weight:600}
+.item .acts button+button{border-left:1px solid var(--line)}
+.empty{color:var(--mut);text-align:center;padding:40px 10px;line-height:1.5}
+#stitchImg{max-width:100%;max-height:100%;display:block;margin:auto}
+#stitchView .sh-body{display:flex;align-items:center;justify-content:center}
+#stitchInfo{font-size:12px;color:var(--mut)}
+.primary{background:var(--acc);border-color:var(--acc);color:#000}
+#toast{position:fixed;left:50%;bottom:calc(150px + env(safe-area-inset-bottom));transform:translateX(-50%);background:rgba(30,30,30,.95);border:1px solid var(--line);padding:9px 14px;border-radius:10px;font-size:13px;max-width:88vw;text-align:center;opacity:0;pointer-events:none;transition:opacity .2s;z-index:20}
+#toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <button class="chip" id="bGhost" title="Show/hide overlay">Ghost</button>
+    <button class="chip" id="bDiff" title="Difference blend: aligned areas turn black">Diff</button>
+    <button class="chip" id="bGrid">Grid</button>
+    <button class="chip" id="bChain" title="Each new shot becomes the next overlay">Chain</button>
+    <span class="sp"></span>
+    <button class="chip" id="bFlip" title="Switch camera" aria-label="Switch camera">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h3l2-3h8l2 3h3v12H3z"/><path d="M9 13a3 3 0 0 1 5.2-2M15 13a3 3 0 0 1-5.2 2"/><path d="M14 9v2h2M10 17v-2H8"/></svg>
+    </button>
+  </header>
+
+  <div id="stage">
+    <div id="vf">
+      <video id="video" playsinline muted autoplay></video>
+      <img id="ghost" alt="">
+      <div id="grid"><i class="gl v" style="left:33.333%"></i><i class="gl v" style="left:66.666%"></i><i class="gl h" style="top:33.333%"></i><i class="gl h" style="top:66.666%"></i></div>
+      <div id="edge"></div>
+      <div id="badge"></div>
+      <div id="flash"></div>
+    </div>
+    <div id="msg"></div>
+  </div>
+
+  <section id="panel">
+    <div class="seg" id="modeSeg">
+      <button data-mode="full">FULL</button>
+      <button data-mode="right" title="Next shot to the right">→</button>
+      <button data-mode="left" title="Next shot to the left">←</button>
+      <button data-mode="up" title="Next shot above">↑</button>
+      <button data-mode="down" title="Next shot below">↓</button>
+    </div>
+    <div class="row"><label for="op">Opacity</label><input type="range" id="op" min="5" max="100" step="1"><output id="opV"></output></div>
+    <div class="row" id="ovRow"><label for="ov">Overlap</label><input type="range" id="ov" min="5" max="70" step="1"><output id="ovV"></output></div>
+    <div class="ctl">
+      <button class="side" id="bGallery" title="Pick reference from gallery" aria-label="Gallery">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="M21 15l-5-5L5 21"/></svg>
+      </button>
+      <button id="shutter" aria-label="Take photo"></button>
+      <button class="side" id="bTray" title="Session shots" aria-label="Session shots">
+        <svg id="trayIco" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="14" height="14" rx="2"/><path d="M7 3h12a2 2 0 0 1 2 2v12"/></svg>
+        <img id="lastThumb" alt="">
+        <span id="count"></span>
+      </button>
+    </div>
+  </section>
+</div>
+
+<div class="sheet" id="tray">
+  <div class="sh-head"><b>Session</b><span class="sp"></span><button class="chip" id="bCloseTray">Close</button></div>
+  <div class="sh-body"><div id="list"></div></div>
+  <div class="sh-foot">
+    <button class="chip" id="bClear">Clear</button><span class="sp"></span>
+    <button class="chip" id="bSaveAll">Save all</button>
+    <button class="chip primary" id="bStitch">Stitch</button>
+  </div>
+</div>
+
+<div class="sheet" id="stitchView">
+  <div class="sh-head"><b>Stitched</b><span id="stitchInfo"></span><span class="sp"></span><button class="chip" id="bCloseStitch">Close</button></div>
+  <div class="sh-body"><img id="stitchImg" alt="Stitched result"></div>
+  <div class="sh-foot"><span class="sp"></span><button class="chip primary" id="bSaveStitch">Save</button></div>
+</div>
+
+<input type="file" id="file" accept="image/*" multiple hidden>
+<div id="toast"></div>
+
+<script>
+(() => {
+'use strict';
+const $ = s => document.querySelector(s);
+const video = $('#video'), ghost = $('#ghost'), vf = $('#vf'), stage = $('#stage'), edge = $('#edge');
+
+/* ---------- settings ---------- */
+const DEF = {mode:'full', op:45, ov:30, ghost:true, diff:false, grid:true, chain:true, facing:'environment'};
+let S = {...DEF};
+try { S = {...DEF, ...JSON.parse(localStorage.getItem('ghostcam') || '{}')}; } catch (_) {}
+const persist = () => { try { localStorage.setItem('ghostcam', JSON.stringify(S)); } catch (_) {} };
+
+/* ---------- state ---------- */
+let stream = null, mirrored = false, aspect = 3/4;
+let shots = [];           // {id, blob, url, w, h, src, rel:{refId,dir,ov}|null, t}
+let refId = null, nextId = 1, stitchBlob = null, wakeLock = null;
+
+/* ---------- utils ---------- */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let toastT;
+function toast(t, ms = 2200) { const el = $('#toast'); el.textContent = t; el.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => el.classList.remove('show'), ms); }
+function showMsg(html) { const m = $('#msg'); m.innerHTML = html; m.style.display = 'flex'; }
+function hideMsg() { $('#msg').style.display = 'none'; }
+const toBlob = (c, q = 0.92) => new Promise(r => c.toBlob(r, 'image/jpeg', q));
+function stamp() { const d = new Date(), p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`; }
+async function loadImage(src) { const im = new Image(); im.decoding = 'async'; im.src = src; await im.decode(); return im; }
+const shotById = id => shots.find(s => s.id === id);
+
+/* ---------- camera ---------- */
+function stopCamera() { if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; } }
+
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showMsg(window.isSecureContext
+      ? '<b>Camera API not available in this browser.</b>You can still load images from the gallery.'
+      : '<b>Camera needs HTTPS.</b>Open this page from an https:// address (GitHub Pages, Netlify, your own domain).<br>Gallery loading still works.');
+    return;
+  }
+  stopCamera();
+  const base = {facingMode: {ideal: S.facing}};
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio:false, video:{...base, width:{ideal:3840}, height:{ideal:2160}}});
+  } catch (e) {
+    try { stream = await navigator.mediaDevices.getUserMedia({audio:false, video:base}); }
+    catch (e2) {
+      showMsg(`<b>Camera unavailable</b>${(e2 && (e2.name + ': ' + e2.message)) || e2}<button class="chip" id="bRetry">Retry</button>`);
+      $('#bRetry').onclick = startCamera;
+      return;
+    }
+  }
+  video.srcObject = stream;
+  try { await video.play(); } catch (_) {}
+  const st = stream.getVideoTracks()[0].getSettings ? stream.getVideoTracks()[0].getSettings() : {};
+  mirrored = st.facingMode ? st.facingMode === 'user' : S.facing === 'user';
+  video.classList.toggle('mirror', mirrored);
+  hideMsg();
+  layout();
+  requestWake();
+}
+
+async function requestWake() {
+  try { if ('wakeLock' in navigator && document.visibilityState === 'visible') wakeLock = await navigator.wakeLock.request('screen'); } catch (_) {}
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    const tr = stream && stream.getVideoTracks()[0];
+    if (!tr || tr.readyState === 'ended') startCamera(); else requestWake();
+  }
+});
+
+/* ---------- layout: viewfinder takes the camera's exact aspect ---------- */
+function layout() {
+  if (video.videoWidth && video.videoHeight) aspect = video.videoWidth / video.videoHeight;
+  else { const r = shotById(refId); if (r) aspect = r.w / r.h; }
+  const r = stage.getBoundingClientRect();
+  let w = r.width, h = w / aspect;
+  if (h > r.height) { h = r.height; w = h * aspect; }
+  vf.style.width = Math.floor(w) + 'px';
+  vf.style.height = Math.floor(h) + 'px';
+}
+video.addEventListener('loadedmetadata', layout);
+video.addEventListener('resize', layout);
+new ResizeObserver(layout).observe(stage);
+
+/* ---------- overlay ---------- */
+function render() {
+  const on = S.ghost && refId != null;
+  ghost.style.display = on ? 'block' : 'none';
+  ghost.style.opacity = S.op / 100;
+  ghost.style.mixBlendMode = S.diff ? 'difference' : 'normal';
+  const k = 100 - S.ov;
+  ghost.style.transform = {
+    full: 'none',
+    right: `translateX(-${k}%)`,   // previous frame's RIGHT strip sits on the LEFT of the view
+    left:  `translateX(${k}%)`,
+    down:  `translateY(-${k}%)`,
+    up:    `translateY(${k}%)`
+  }[S.mode];
+
+  const adj = S.mode !== 'full';
+  edge.style.display = on && adj ? 'block' : 'none';
+  edge.className = (S.mode === 'right' || S.mode === 'left') ? 'v' : 'h';
+  edge.style.left = edge.style.top = '';
+  if (S.mode === 'right') edge.style.left = S.ov + '%';
+  if (S.mode === 'left')  edge.style.left = (100 - S.ov) + '%';
+  if (S.mode === 'down')  edge.style.top = S.ov + '%';
+  if (S.mode === 'up')    edge.style.top = (100 - S.ov) + '%';
+
+  $('#ovRow').style.display = adj ? 'flex' : 'none';
+  $('#grid').style.display = S.grid ? 'block' : 'none';
+  document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on', b.dataset.mode === S.mode));
+  $('#bGhost').classList.toggle('on', S.ghost);
+  $('#bDiff').classList.toggle('on', S.diff);
+  $('#bGrid').classList.toggle('on', S.grid);
+  $('#bChain').classList.toggle('on', S.chain);
+  $('#op').value = S.op; $('#opV').textContent = S.op + '%';
+  $('#ov').value = S.ov; $('#ovV').textContent = S.ov + '%';
+
+  const badge = $('#badge');
+  const ref = shotById(refId);
+  if (ref) { badge.style.display = 'block'; badge.textContent = `Ghost #${ref.id}` + (adj ? `  ${({right:'→',left:'←',up:'↑',down:'↓'})[S.mode]} ${S.ov}%` : ''); }
+  else badge.style.display = 'none';
+
+  const last = shots[shots.length - 1];
+  const lt = $('#lastThumb'), cnt = $('#count');
+  if (last) { lt.src = last.url; lt.style.display = 'block'; $('#trayIco').style.display = 'none'; cnt.textContent = shots.length; cnt.style.display = 'flex'; }
+  else { lt.style.display = 'none'; $('#trayIco').style.display = 'block'; cnt.style.display = 'none'; }
+  persist();
+}
+
+function setRef(id) {
+  refId = id;
+  const s = shotById(id);
+  if (s) ghost.src = s.url; else ghost.removeAttribute('src');
+  if (!video.videoWidth) layout();
+  render();
+}
+
+/* press-and-hold on the viewfinder = peek without the ghost */
+vf.addEventListener('pointerdown', () => ghost.classList.add('peek'));
+['pointerup','pointercancel','pointerleave'].forEach(e => vf.addEventListener(e, () => ghost.classList.remove('peek')));
+
+/* ---------- shots ---------- */
+function addShot(blob, w, h, src, rel) {
+  const s = {id: nextId++, blob, url: URL.createObjectURL(blob), w, h, src, rel, t: stamp()};
+  shots.push(s);
+  return s;
+}
+
+async function capture() {
+  if (!video.videoWidth) { toast('Camera not ready'); return; }
+  const w = video.videoWidth, h = video.videoHeight;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d');
+  if (mirrored) { x.translate(w, 0); x.scale(-1, 1); }
+  x.drawImage(video, 0, 0, w, h);
+  const f = $('#flash'); f.classList.add('go'); requestAnimationFrame(() => requestAnimationFrame(() => f.classList.remove('go')));
+  if (navigator.vibrate) navigator.vibrate(15);
+  const blob = await toBlob(c);
+  const rel = (refId != null && S.ghost && S.mode !== 'full') ? {refId, dir: S.mode, ov: S.ov / 100} : null;
+  const s = addShot(blob, w, h, 'cam', rel);
+  if (S.chain) setRef(s.id); else render();
+}
+
+/* gallery → crop to camera aspect so overlay geometry matches the live frame */
+async function importFiles(files) {
+  let last = null;
+  for (const f of files) {
+    const u = URL.createObjectURL(f);
+    try {
+      const im = await loadImage(u);
+      let iw = im.naturalWidth, ih = im.naturalHeight, sx = 0, sy = 0, sw = iw, sh = ih;
+      if (video.videoWidth) {
+        const A = video.videoWidth / video.videoHeight;
+        if (iw / ih > A) { sw = Math.round(ih * A); sx = (iw - sw) / 2; }
+        else { sh = Math.round(iw / A); sy = (ih - sh) / 2; }
+      }
+      const lim = Math.max(video.videoWidth, video.videoHeight, 1920);
+      const sc = Math.min(1, lim / Math.max(sw, sh));
+      const c = document.createElement('canvas');
+      c.width = Math.round(sw * sc); c.height = Math.round(sh * sc);
+      c.getContext('2d').drawImage(im, sx, sy, sw, sh, 0, 0, c.width, c.height);
+      last = addShot(await toBlob(c), c.width, c.height, 'gallery', null);
+    } catch (e) { toast('Could not read ' + f.name); }
+    finally { URL.revokeObjectURL(u); }
+  }
+  if (last) { setRef(last.id); toast('Loaded as ghost'); }
+}
+
+function deleteShot(id) {
+  const i = shots.findIndex(s => s.id === id); if (i < 0) return;
+  URL.revokeObjectURL(shots[i].url); shots.splice(i, 1);
+  if (refId === id) setRef(null);
+  render(); renderTray();
+}
+
+/* ---------- saving ---------- */
+async function saveFiles(items) {   // [{blob, name}]
+  const files = items.map(i => new File([i.blob], i.name, {type: 'image/jpeg'}));
+  if (navigator.canShare && navigator.share) {
+    try { if (navigator.canShare({files})) { await navigator.share({files}); return; } }
+    catch (e) { if (e && e.name === 'AbortError') return; }
+  }
+  for (const f of files) {
+    const a = document.createElement('a'), u = URL.createObjectURL(f);
+    a.href = u; a.download = f.name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(u), 5000);
+    await sleep(300);
+  }
+}
+const fname = s => `ghostcam_${s.t}_${String(s.id).padStart(3, '0')}.jpg`;
+
+/* ---------- tray ---------- */
+const ARW = {right:'→', left:'←', up:'↑', down:'↓'};
+function renderTray() {
+  const L = $('#list');
+  if (!shots.length) { L.innerHTML = '<div class="empty" style="grid-column:1/-1">No shots yet.<br>Take a photo or load one from the gallery.</div>'; return; }
+  L.innerHTML = shots.map(s => `
+    <div class="item${s.id === refId ? ' ref' : ''}" data-id="${s.id}">
+      <img src="${s.url}" alt="" data-act="ref">
+      <div class="meta"><span>#${s.id}${s.src === 'gallery' ? ' · gallery' : ''}</span><span>${s.rel ? `${ARW[s.rel.dir]} #${s.rel.refId} · ${Math.round(s.rel.ov * 100)}%` : ''}</span></div>
+      <div class="acts"><button data-act="ref">${s.id === refId ? 'Ghost ✓' : 'Ghost'}</button><button data-act="save">Save</button><button data-act="del">Del</button></div>
+    </div>`).join('');
+}
+$('#list').addEventListener('click', e => {
+  const b = e.target.closest('[data-act]'), it = e.target.closest('.item'); if (!b || !it) return;
+  const id = +it.dataset.id, s = shotById(id);
+  if (b.dataset.act === 'ref') { setRef(id); closeSheet('#tray'); }
+  else if (b.dataset.act === 'save') saveFiles([{blob: s.blob, name: fname(s)}]);
+  else if (b.dataset.act === 'del') deleteShot(id);
+});
+function openSheet(sel) { $(sel).classList.add('open'); }
+function closeSheet(sel) { $(sel).classList.remove('open'); }
+
+/* ---------- stitching ---------- */
+/* Walk back from the newest linked shot through its ref links. Because each shot was aligned so that
+   its leading `ov` fraction matches the previous frame's trailing `ov` fraction, placement is exact
+   (same zoom, same aspect); the overlap zone is feather-blended. */
+function chainFrom(end) {
+  const chain = []; let cur = end;
+  const seen = new Set();
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id); chain.unshift(cur);
+    if (!cur.rel) break;
+    cur = shotById(cur.rel.refId);
+  }
+  return chain;
+}
+
+async function stitch() {
+  const end = [...shots].reverse().find(s => s.rel);
+  const chain = end ? chainFrom(end) : [];
+  if (chain.length < 2) { toast('No linked sequence. Shoot in → ← ↑ ↓ mode, aligning each shot to the ghost strip.', 3500); return; }
+  toast(`Stitching ${chain.length} shots…`, 1500);
+
+  const W = chain[0].w, H = chain[0].h;
+  const pos = [[0, 0]]; let x = 0, y = 0;
+  for (let i = 1; i < chain.length; i++) {
+    const {dir, ov} = chain[i].rel;
+    if (dir === 'right') x += W * (1 - ov); else if (dir === 'left') x -= W * (1 - ov);
+    else if (dir === 'down') y += H * (1 - ov); else if (dir === 'up') y -= H * (1 - ov);
+    pos.push([x, y]);
+  }
+  const minX = Math.min(...pos.map(p => p[0])), minY = Math.min(...pos.map(p => p[1]));
+  const OW = Math.max(...pos.map(p => p[0])) + W - minX, OH = Math.max(...pos.map(p => p[1])) + H - minY;
+  const s = Math.min(1, 8192 / Math.max(OW, OH), Math.sqrt(16e6 / (OW * OH)));   // stay under mobile canvas limits
+
+  const out = document.createElement('canvas');
+  out.width = Math.round(OW * s); out.height = Math.round(OH * s);
+  const o = out.getContext('2d'); o.fillStyle = '#000'; o.fillRect(0, 0, out.width, out.height);
+  const tw = Math.round(W * s), th = Math.round(H * s);
+
+  for (let i = 0; i < chain.length; i++) {
+    const im = await loadImage(chain[i].url);
+    const dx = Math.round((pos[i][0] - minX) * s), dy = Math.round((pos[i][1] - minY) * s);
+    if (i === 0) { o.drawImage(im, dx, dy, tw, th); continue; }
+    const t = document.createElement('canvas'); t.width = tw; t.height = th;
+    const tc = t.getContext('2d');
+    tc.drawImage(im, 0, 0, tw, th);
+    const {dir, ov} = chain[i].rel;
+    let g;
+    if (dir === 'right') g = tc.createLinearGradient(0, 0, tw * ov, 0);
+    else if (dir === 'left') g = tc.createLinearGradient(tw, 0, tw * (1 - ov), 0);
+    else if (dir === 'down') g = tc.createLinearGradient(0, 0, 0, th * ov);
+    else g = tc.createLinearGradient(0, th, 0, th * (1 - ov));
+    g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,1)');
+    tc.globalCompositeOperation = 'destination-in'; tc.fillStyle = g; tc.fillRect(0, 0, tw, th);
+    o.drawImage(t, dx, dy);
+  }
+  stitchBlob = await toBlob(out, 0.93);
+  const img = $('#stitchImg');
+  if (img.src) URL.revokeObjectURL(img.src);
+  img.src = URL.createObjectURL(stitchBlob);
+  $('#stitchInfo').textContent = `${chain.length} shots · ${out.width}×${out.height}`;
+  openSheet('#stitchView');
+}
+
+/* ---------- wiring ---------- */
+document.querySelectorAll('#modeSeg button').forEach(b => b.onclick = () => { S.mode = b.dataset.mode; render(); });
+$('#op').oninput = e => { S.op = +e.target.value; render(); };
+$('#ov').oninput = e => { S.ov = +e.target.value; render(); };
+$('#bGhost').onclick = () => { S.ghost = !S.ghost; render(); };
+$('#bDiff').onclick  = () => { S.diff = !S.diff; render(); };
+$('#bGrid').onclick  = () => { S.grid = !S.grid; render(); };
+$('#bChain').onclick = () => { S.chain = !S.chain; render(); toast(S.chain ? 'Chain on: each shot becomes the next ghost' : 'Chain off: ghost stays fixed'); };
+$('#bFlip').onclick  = () => { S.facing = S.facing === 'user' ? 'environment' : 'user'; persist(); startCamera(); };
+$('#shutter').onclick = capture;
+$('#bGallery').onclick = () => $('#file').click();
+$('#file').onchange = e => { const f = [...e.target.files]; e.target.value = ''; if (f.length) importFiles(f); };
+$('#bTray').onclick = () => { renderTray(); openSheet('#tray'); };
+$('#bCloseTray').onclick = () => closeSheet('#tray');
+$('#bSaveAll').onclick = () => shots.length ? saveFiles(shots.map(s => ({blob: s.blob, name: fname(s)}))) : toast('Nothing to save');
+$('#bStitch').onclick = () => { closeSheet('#tray'); stitch(); };
+$('#bCloseStitch').onclick = () => closeSheet('#stitchView');
+$('#bSaveStitch').onclick = () => stitchBlob && saveFiles([{blob: stitchBlob, name: `ghostcam_${stamp()}_stitch.jpg`}]);
+let clearArm = 0;
+$('#bClear').onclick = () => {
+  if (Date.now() - clearArm > 2500) { clearArm = Date.now(); toast('Tap Clear again to delete all session shots'); return; }
+  shots.forEach(s => URL.revokeObjectURL(s.url)); shots = []; setRef(null); renderTray(); clearArm = 0;
+};
+document.addEventListener('keydown', e => { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); capture(); } });
+window.addEventListener('beforeunload', e => { if (shots.length) { e.preventDefault(); e.returnValue = ''; } });
+
+render();
+startCamera();
+})();
+</script>
+</body>
+</html>
