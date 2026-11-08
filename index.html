@@ -150,7 +150,7 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border:0;border-radiu
 <div class="sheet" id="stitchView">
   <div class="sh-head"><b>Stitched</b><span id="stitchInfo"></span><span class="sp"></span><button class="chip" id="bCloseStitch">Close</button></div>
   <div class="sh-body"><img id="stitchImg" alt="Stitched result"></div>
-  <div class="sh-foot"><span class="sp"></span><button class="chip primary" id="bSaveStitch">Save</button></div>
+  <div class="sh-foot"><button class="chip" id="bCrop">Crop</button><span class="sp"></span><button class="chip primary" id="bSaveStitch">Save</button></div>
 </div>
 
 <input type="file" id="file" accept="image/*" multiple hidden>
@@ -318,6 +318,7 @@ async function capture() {
   const blob = await toBlob(c);
   const rel = (refId != null && S.ghost && S.mode !== 'full') ? {refId, dir: S.mode, ov: S.ov / 100} : null;
   const s = addShot(blob, w, h, 'cam', rel);
+  if (rel) loadCV().catch(() => {});   // warm up the stitcher in the background
   if (S.chain) setRef(s.id); else render();
 }
 
@@ -392,9 +393,7 @@ function openSheet(sel) { $(sel).classList.add('open'); }
 function closeSheet(sel) { $(sel).classList.remove('open'); }
 
 /* ---------- stitching ---------- */
-/* Walk back from the newest linked shot through its ref links. Because each shot was aligned so that
-   its leading `ov` fraction matches the previous frame's trailing `ov` fraction, placement is exact
-   (same zoom, same aspect); the overlap zone is feather-blended. */
+/* Chain = newest linked shot walked back through its ref links. */
 function chainFrom(end) {
   const chain = []; let cur = end;
   const seen = new Set();
@@ -406,52 +405,350 @@ function chainFrom(end) {
   return chain;
 }
 
-async function stitch() {
-  const end = [...shots].reverse().find(s => s.rel);
-  const chain = end ? chainFrom(end) : [];
-  if (chain.length < 2) { toast('No linked sequence. Shoot in → ← ↑ ↓ mode, aligning each shot to the ghost strip.', 3500); return; }
-  toast(`Stitching ${chain.length} shots…`, 1500);
+const mkCanvas = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+const nextFrame = () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
+/* where the current frame sits relative to the previous one, as the overlap setting assumes:
+   x_prev = x_cur + tx, y_prev = y_cur + ty */
+function priorShift(rel, W, H) {
+  const k = 1 - rel.ov;
+  return {right: [W * k, 0], left: [-W * k, 0], down: [0, H * k], up: [0, -H * k]}[rel.dir];
+}
+
+/* 3×3 row-major homography helpers */
+const M3 = {
+  I: () => [1,0,0, 0,1,0, 0,0,1],
+  T: (x, y) => [1,0,x, 0,1,y, 0,0,1],
+  S: s => [s,0,0, 0,s,0, 0,0,1],
+  mul(a, b) { const r = new Array(9); for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) r[i*3+j] = a[i*3]*b[j] + a[i*3+1]*b[3+j] + a[i*3+2]*b[6+j]; return r; },
+  inv(m) {
+    const [a,b,c,d,e,f,g,h,i] = m;
+    const A = e*i - f*h, B = -(d*i - f*g), C = d*h - e*g, det = a*A + b*B + c*C;
+    if (Math.abs(det) < 1e-12) return null;
+    return [A/det, -(b*i - c*h)/det, (b*f - c*e)/det, B/det, (a*i - c*g)/det, -(a*f - c*d)/det, C/det, -(a*h - b*g)/det, (a*e - b*d)/det];
+  },
+  ap(m, x, y) { const w = m[6]*x + m[7]*y + m[8]; return [(m[0]*x + m[1]*y + m[2]) / w, (m[3]*x + m[4]*y + m[5]) / w, w]; }
+};
+
+/* ---- OpenCV.js: vendored next to index.html, loaded once on demand ---- */
+let cvPromise = null;
+function loadCV() {
+  if (cvPromise) return cvPromise;
+  cvPromise = new Promise((resolve, reject) => {
+    const ready = () => window.cv && window.cv.Mat && window.cv.ORB;
+    if (ready()) return resolve();   // never resolve WITH cv: the Emscripten module is a thenable and would loop forever
+    const s = document.createElement('script');
+    s.src = 'opencv.js'; s.async = true;
+    s.onerror = () => { cvPromise = null; reject(new Error('opencv.js failed to load')); };
+    document.head.appendChild(s);
+    const t0 = Date.now(); let hooked = false;
+    (function poll() {
+      if (window.cv && !window.cv.Mat && typeof window.cv.then === 'function' && !hooked) { hooked = true; window.cv.then(m => { window.cv = m; }); }
+      if (ready()) return resolve();
+      if (Date.now() - t0 > 120000) { cvPromise = null; return reject(new Error('opencv.js timeout')); }
+      setTimeout(poll, 100);
+    })();
+  });
+  return cvPromise;
+}
+
+/* Search region for features: the overlap band (+15% slack) on the trailing side of prev / leading side of cur. */
+function bandRect(cv, rel, which, w, h) {
+  const f = Math.min(1, rel.ov + 0.15), bw = Math.round(w * f), bh = Math.round(h * f);
+  const trail = which === 'prev';
+  const side = {right: trail ? 'R' : 'L', left: trail ? 'L' : 'R', down: trail ? 'B' : 'T', up: trail ? 'T' : 'B'}[rel.dir];
+  return side === 'R' ? new cv.Rect(w - bw, 0, bw, h) : side === 'L' ? new cv.Rect(0, 0, bw, h)
+       : side === 'B' ? new cv.Rect(0, h - bh, w, bh) : new cv.Rect(0, 0, w, bh);
+}
+
+/* ORB + ratio test + prior-consistency gate + RANSAC homography (affine when evidence is thin).
+   Works in detection resolution; returns H mapping cur → prev in that resolution. */
+function estimatePair(cv, gPrev, gCur, rel, dw, dh) {
+  const bag = []; const k = o => (bag.push(o), o);
+  try {
+    const mp = k(cv.Mat.zeros(dh, dw, cv.CV_8U)), mc = k(cv.Mat.zeros(dh, dw, cv.CV_8U));
+    let r = mp.roi(bandRect(cv, rel, 'prev', dw, dh)); r.setTo(new cv.Scalar(255)); r.delete();
+    r = mc.roi(bandRect(cv, rel, 'cur', dw, dh)); r.setTo(new cv.Scalar(255)); r.delete();
+    const orb = k(new cv.ORB(4000));
+    const k1 = k(new cv.KeyPointVector()), k2 = k(new cv.KeyPointVector()), d1 = k(new cv.Mat()), d2 = k(new cv.Mat());
+    orb.detectAndCompute(gPrev, mp, k1, d1);
+    orb.detectAndCompute(gCur, mc, k2, d2);
+    if (d1.rows < 15 || d2.rows < 15) return {ok: false, why: 'too little texture'};
+    const bf = k(new cv.BFMatcher(cv.NORM_HAMMING, false)), mv = k(new cv.DMatchVectorVector());
+    bf.knnMatch(d2, d1, mv, 2);
+    const [tx, ty] = priorShift(rel, dw, dh), gate = 0.3 * Math.max(dw, dh);
+    const src = [], dst = [];
+    for (let i = 0; i < mv.size(); i++) {
+      const pr = mv.get(i);
+      if (pr.size() >= 2) {
+        const m = pr.get(0), n = pr.get(1);
+        if (m.distance < 0.8 * n.distance) {
+          const a = k2.get(m.queryIdx).pt, b = k1.get(m.trainIdx).pt;
+          if (Math.hypot(a.x + tx - b.x, a.y + ty - b.y) < gate) { src.push(a.x, a.y); dst.push(b.x, b.y); }
+        }
+      }
+      if (pr.delete) pr.delete();
+    }
+    const n = src.length / 2;
+    if (n < 12) return {ok: false, why: `${n} matches`};
+    const sm = k(cv.matFromArray(n, 1, cv.CV_32FC2, src)), dm = k(cv.matFromArray(n, 1, cv.CV_32FC2, dst));
+    const inl = k(new cv.Mat());
+    const Hm = k(cv.findHomography(sm, dm, cv.RANSAC, 3, inl));
+    if (Hm.empty()) return {ok: false, why: 'no model'};
+    const ni = cv.countNonZero(inl);
+    if (ni >= 40 && ni >= 0.25 * n) return {ok: true, H: Array.from(Hm.data64F), inliers: ni, matches: n, model: 'H'};
+    // thin evidence: 6-dof affine is far less prone to wild perspective than an 8-dof homography
+    const inl2 = k(new cv.Mat());
+    const A = k(cv.estimateAffine2D(sm, dm, inl2, cv.RANSAC, 3));
+    if (A.empty()) return {ok: false, why: 'no affine'};
+    const na = cv.countNonZero(inl2);
+    if (na < 12 || na < 0.25 * n) return {ok: false, why: `${na} inliers`};
+    const a = A.data64F;
+    return {ok: true, H: [a[0], a[1], a[2], a[3], a[4], a[5], 0, 0, 1], inliers: na, matches: n, model: 'A'};
+  } finally { bag.forEach(o => { try { o.delete(); } catch (_) {} }); }
+}
+
+/* Reject estimates that disagree wildly with where the user aimed. Only the leading edge (inside the overlap)
+   and the centre are compared with the aim: far corners legitimately stretch under camera rotation. */
+function plausible(Hf, W, H, rel, tx, ty) {
+  const C = [[0,0],[W,0],[W,H],[0,H]], q = [];
+  for (const [x, y] of C) {
+    const p = M3.ap(Hf, x, y);
+    if (!(p[2] > 0) || !isFinite(p[0]) || !isFinite(p[1])) return false;
+    q.push(p);
+  }
+  const lead = {right: [0, 3], left: [1, 2], down: [0, 1], up: [2, 3]}[rel.dir], tol = 0.3 * Math.max(W, H);
+  for (const i of lead) if (Math.hypot(q[i][0] - (C[i][0] + tx), q[i][1] - (C[i][1] + ty)) > tol) return false;
+  const c = M3.ap(Hf, W / 2, H / 2);
+  if (Math.hypot(c[0] - (W / 2 + tx), c[1] - (H / 2 + ty)) > 0.4 * Math.max(W, H)) return false;
+  let area = 0, sgn = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = q[i], b = q[(i + 1) % 4], d = q[(i + 2) % 4];
+    area += a[0]*b[1] - b[0]*a[1];
+    const cr = Math.sign((b[0] - a[0]) * (d[1] - b[1]) - (b[1] - a[1]) * (d[0] - b[0]));
+    if (sgn && cr && cr !== sgn) return false;            // non-convex / folded quad
+    sgn = sgn || cr;
+  }
+  const ratio = Math.abs(area / 2) / (W * H);
+  return ratio > 0.4 && ratio < 2.5;
+}
+
+function distPadded(cv, m) {          // distance to nearest uncovered pixel, image border counts as uncovered
+  const p = new cv.Mat(), d = new cv.Mat();
+  cv.copyMakeBorder(m, p, 1, 1, 1, 1, cv.BORDER_CONSTANT, new cv.Scalar(0));
+  cv.distanceTransform(p, d, cv.DIST_L2, 3);
+  const a = d.data32F.slice(); p.delete(); d.delete(); return a;
+}
+
+/* Largest-ish axis-aligned rectangle fully inside the covered area (greedy edge shaving on a coarse grid). */
+function autoCrop(union, cw, ch) {
+  const f = Math.max(1, Math.ceil(Math.max(cw, ch) / 1200)), gw = Math.floor(cw / f), gh = Math.floor(ch / f);
+  const g = new Uint8Array(gw * gh);
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) g[y*gw + x] = union[(y*f + (f >> 1)) * cw + x*f + (f >> 1)] ? 1 : 0;
+  let t = 0, b = gh - 1, l = 0, r = gw - 1;
+  const rowMiss = y => { let c = 0; for (let x = l; x <= r; x++) c += !g[y*gw + x]; return c / (r - l + 1); };
+  const colMiss = x => { let c = 0; for (let y = t; y <= b; y++) c += !g[y*gw + x]; return c / (b - t + 1); };
+  for (let it = 0; it < gw + gh; it++) {
+    const m = {t: rowMiss(t), b: rowMiss(b), l: colMiss(l), r: colMiss(r)};
+    const key = Object.keys(m).reduce((a, c) => m[c] > m[a] ? c : a, 't');
+    if (m[key] === 0) break;
+    if (key === 't') t++; else if (key === 'b') b--; else if (key === 'l') l++; else r--;
+    if (b - t < gh * 0.2 || r - l < gw * 0.2) return null;
+  }
+  const x0 = (l ? l + 1 : 0) * f, y0 = (t ? t + 1 : 0) * f;
+  const x1 = Math.min(cw, (r < gw - 1 ? r : gw) * f), y1 = Math.min(ch, (b < gh - 1 ? b : gh) * f);
+  if (x0 === 0 && y0 === 0 && x1 >= cw - f && y1 >= ch - f) return null;
+  return {x: x0, y: y0, w: x1 - x0, h: y1 - y0};
+}
+
+/* Feature-aligned stitch:
+   1. ORB matches inside the expected overlap band; RANSAC homography per link (fallback: overlap prior).
+   2. Links chained, re-referenced to the middle frame to spread perspective stretch evenly.
+   3. Each frame warped into the panorama; per-channel gain matched to what's already there (exposure/WB).
+   4. Seam: distance-weighted feather (weight ∝ distance to each image's own border). */
+async function smartStitch(chain, prog = () => {}) {
+  const cv = window.cv;
+  const n = chain.length, W = chain[0].w, H = chain[0].h;
+  const imgs = [];
+  for (const s of chain) imgs.push(await loadImage(s.url));
+
+  const sd = Math.min(1, 1000 / Math.max(W, H)), dw = Math.round(W * sd), dh = Math.round(H * sd);
+  const grays = imgs.map(im => {
+    const c = mkCanvas(dw, dh); c.getContext('2d').drawImage(im, 0, 0, dw, dh);
+    const m = cv.imread(c), g = new cv.Mat(); cv.cvtColor(m, g, cv.COLOR_RGBA2GRAY); m.delete(); return g;
+  });
+
+  const link = [null], how = [];
+  for (let i = 1; i < n; i++) {
+    prog(`Matching ${i}/${n - 1}…`); await nextFrame();
+    const rel = chain[i].rel, [tx, ty] = priorShift(rel, W, H);
+    let Hf = M3.T(tx, ty), info = 'overlap';
+    try {
+      const r = estimatePair(cv, grays[i - 1], grays[i], rel, dw, dh);
+      if (r.ok) {
+        const h = r.H, cand = [h[0], h[1], h[2] / sd, h[3], h[4], h[5] / sd, h[6] * sd, h[7] * sd, h[8]];
+        if (plausible(cand, W, H, rel, tx, ty)) { Hf = cand; info = `${r.model}:${r.inliers}`; }
+        else info = 'rejected';
+      } else info = r.why;
+    } catch (e) { console.warn('match', e); info = 'error'; }
+    link.push(Hf); how.push(info);
+  }
+  grays.forEach(g => g.delete());
+
+  const H0 = [M3.I()];
+  for (let i = 1; i < n; i++) H0.push(M3.mul(H0[i - 1], link[i]));
+  const mid = Math.floor((n - 1) / 2), Hmi = M3.inv(H0[mid]);
+  if (!Hmi) throw new Error('singular chain');
+  const G = H0.map(h => M3.mul(Hmi, h));
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const g of G) for (const [x, y] of [[0,0],[W,0],[W,H],[0,H]]) {
+    const p = M3.ap(g, x, y);
+    if (!(p[2] > 0)) throw new Error('frame behind camera');
+    minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]); minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]);
+  }
+  const OW = maxX - minX, OH = maxY - minY;
+  if (!(OW * OH < n * W * H * 3)) throw new Error('panorama too stretched');
+  const so = Math.min(1, 8192 / Math.max(OW, OH), Math.sqrt(16e6 / (OW * OH)));   // mobile canvas limits
+  const cw = Math.ceil(OW * so), ch = Math.ceil(OH * so);
+  const out = mkCanvas(cw, ch), octx = out.getContext('2d', {willReadFrequently: true});
+  octx.fillStyle = '#000'; octx.fillRect(0, 0, cw, ch);
+  const union = new Uint8Array(cw * ch);
+  const base = M3.mul(M3.S(so), M3.T(-minX, -minY));
+  const si = Math.min(1, so * 1.25), sw = Math.round(W * si), sh = Math.round(H * si);
+  const gains = [];
+
+  for (let i = 0; i < n; i++) {
+    prog(`Blending ${i + 1}/${n}…`); await nextFrame();
+    const P = M3.mul(base, G[i]);
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const [x, y] of [[0,0],[W,0],[W,H],[0,H]]) { const p = M3.ap(P, x, y); x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]); }
+    const rx = Math.max(0, Math.floor(x0)), ry = Math.max(0, Math.floor(y0));
+    const rw = Math.min(cw, Math.ceil(x1)) - rx, rh = Math.min(ch, Math.ceil(y1)) - ry;
+    if (rw < 2 || rh < 2) continue;
+
+    const c = mkCanvas(sw, sh); c.getContext('2d').drawImage(imgs[i], 0, 0, sw, sh);
+    const src = cv.imread(c); c.width = c.height = 0;
+    const Mm = cv.matFromArray(3, 3, cv.CV_64F, M3.mul(M3.mul(M3.T(-rx, -ry), P), M3.S(1 / si)));
+    const warped = new cv.Mat();
+    cv.warpPerspective(src, warped, Mm, new cv.Size(rw, rh), cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(0, 0, 0, 0));
+    src.delete(); Mm.delete();
+    const wd = warped.data, N = rw * rh;
+
+    const mask = new cv.Mat(rh, rw, cv.CV_8U), md = mask.data;
+    for (let p = 0, q = 3; p < N; p++, q += 4) md[p] = wd[q] === 255 ? 255 : 0;
+    const kern = cv.Mat.ones(3, 3, cv.CV_8U);
+    cv.erode(mask, mask, kern, new cv.Point(-1, -1), 1, cv.BORDER_CONSTANT, new cv.Scalar(0));
+    kern.delete();
+
+    const um = new cv.Mat(rh, rw, cv.CV_8U), ud = um.data;
+    let overlap = false;
+    for (let y = 0; y < rh; y++) { const off = (y + ry) * cw + rx; ud.set(union.subarray(off, off + rw), y * rw); }
+    for (let p = 0; p < N; p++) if (md[p] && ud[p]) { overlap = true; break; }
+
+    const img = octx.getImageData(rx, ry, rw, rh), od = img.data;
+    let g0 = 1, g1 = 1, g2 = 1, dI = null, dU = null;
+    if (overlap) {
+      let a0 = 0, a1 = 0, a2 = 0, b0 = 0, b1 = 0, b2 = 0, cnt = 0;
+      for (let p = 0, q = 0; p < N; p++, q += 4) if (md[p] && ud[p]) {
+        a0 += od[q]; a1 += od[q+1]; a2 += od[q+2]; b0 += wd[q]; b1 += wd[q+1]; b2 += wd[q+2]; cnt++;
+      }
+      if (cnt > 500) { g0 = clamp(a0 / Math.max(b0, 1), 0.6, 1.6); g1 = clamp(a1 / Math.max(b1, 1), 0.6, 1.6); g2 = clamp(a2 / Math.max(b2, 1), 0.6, 1.6); }
+      dI = distPadded(cv, mask); dU = distPadded(cv, um);
+    }
+    gains.push([g0, g1, g2].map(v => +v.toFixed(2)));
+
+    const pw = rw + 2;
+    for (let y = 0; y < rh; y++) {
+      const urow = (y + ry) * cw + rx;
+      for (let x = 0; x < rw; x++) {
+        const p = y * rw + x;
+        if (!md[p]) continue;
+        const q = p * 4;
+        let a = 1;
+        if (overlap && ud[p]) { const j = (y + 1) * pw + x + 1, di = dI[j], du = dU[j]; a = di / (di + du + 1e-6); }
+        const b = 1 - a;
+        od[q]   = wd[q]   * g0 * a + od[q]   * b;
+        od[q+1] = wd[q+1] * g1 * a + od[q+1] * b;
+        od[q+2] = wd[q+2] * g2 * a + od[q+2] * b;
+        od[q+3] = 255;
+        union[urow + x] = 255;
+      }
+    }
+    octx.putImageData(img, rx, ry);
+    warped.delete(); mask.delete(); um.delete();
+  }
+  const aligned = how.filter(h => /^[HA]:/.test(h)).length;
+  return {canvas: out, crop: autoCrop(union, cw, ch), aligned, links: n - 1, how, gains};
+}
+
+/* Fallback: pure overlap-prior placement with linear feather (no OpenCV). */
+async function basicStitch(chain) {
   const W = chain[0].w, H = chain[0].h;
   const pos = [[0, 0]]; let x = 0, y = 0;
-  for (let i = 1; i < chain.length; i++) {
-    const {dir, ov} = chain[i].rel;
-    if (dir === 'right') x += W * (1 - ov); else if (dir === 'left') x -= W * (1 - ov);
-    else if (dir === 'down') y += H * (1 - ov); else if (dir === 'up') y -= H * (1 - ov);
-    pos.push([x, y]);
-  }
+  for (let i = 1; i < chain.length; i++) { const [tx, ty] = priorShift(chain[i].rel, W, H); x += tx; y += ty; pos.push([x, y]); }
   const minX = Math.min(...pos.map(p => p[0])), minY = Math.min(...pos.map(p => p[1]));
   const OW = Math.max(...pos.map(p => p[0])) + W - minX, OH = Math.max(...pos.map(p => p[1])) + H - minY;
-  const s = Math.min(1, 8192 / Math.max(OW, OH), Math.sqrt(16e6 / (OW * OH)));   // stay under mobile canvas limits
-
-  const out = document.createElement('canvas');
-  out.width = Math.round(OW * s); out.height = Math.round(OH * s);
+  const s = Math.min(1, 8192 / Math.max(OW, OH), Math.sqrt(16e6 / (OW * OH)));
+  const out = mkCanvas(Math.round(OW * s), Math.round(OH * s));
   const o = out.getContext('2d'); o.fillStyle = '#000'; o.fillRect(0, 0, out.width, out.height);
   const tw = Math.round(W * s), th = Math.round(H * s);
-
   for (let i = 0; i < chain.length; i++) {
     const im = await loadImage(chain[i].url);
     const dx = Math.round((pos[i][0] - minX) * s), dy = Math.round((pos[i][1] - minY) * s);
     if (i === 0) { o.drawImage(im, dx, dy, tw, th); continue; }
-    const t = document.createElement('canvas'); t.width = tw; t.height = th;
-    const tc = t.getContext('2d');
+    const t = mkCanvas(tw, th), tc = t.getContext('2d');
     tc.drawImage(im, 0, 0, tw, th);
     const {dir, ov} = chain[i].rel;
-    let g;
-    if (dir === 'right') g = tc.createLinearGradient(0, 0, tw * ov, 0);
-    else if (dir === 'left') g = tc.createLinearGradient(tw, 0, tw * (1 - ov), 0);
-    else if (dir === 'down') g = tc.createLinearGradient(0, 0, 0, th * ov);
-    else g = tc.createLinearGradient(0, th, 0, th * (1 - ov));
+    const g = dir === 'right' ? tc.createLinearGradient(0, 0, tw * ov, 0) : dir === 'left' ? tc.createLinearGradient(tw, 0, tw * (1 - ov), 0)
+            : dir === 'down' ? tc.createLinearGradient(0, 0, 0, th * ov) : tc.createLinearGradient(0, th, 0, th * (1 - ov));
     g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,1)');
     tc.globalCompositeOperation = 'destination-in'; tc.fillStyle = g; tc.fillRect(0, 0, tw, th);
     o.drawImage(t, dx, dy);
   }
-  stitchBlob = await toBlob(out, 0.93);
+  return {canvas: out, crop: null, aligned: 0, links: chain.length - 1, basic: true};
+}
+
+window.GhostStitch = {smartStitch, basicStitch, loadCV, autoCrop};   // exposed for testing
+
+let stitchRes = null, cropOn = true, busy = false;
+async function showStitch() {
+  const r = stitchRes; if (!r) return;
+  const useCrop = cropOn && r.crop;
+  let c = r.canvas;
+  if (useCrop) { c = mkCanvas(r.crop.w, r.crop.h); c.getContext('2d').drawImage(r.canvas, r.crop.x, r.crop.y, r.crop.w, r.crop.h, 0, 0, r.crop.w, r.crop.h); }
+  stitchBlob = await toBlob(c, 0.93);
   const img = $('#stitchImg');
   if (img.src) URL.revokeObjectURL(img.src);
   img.src = URL.createObjectURL(stitchBlob);
-  $('#stitchInfo').textContent = `${chain.length} shots · ${out.width}×${out.height}`;
-  openSheet('#stitchView');
+  $('#bCrop').style.display = r.crop ? 'inline-flex' : 'none';
+  $('#bCrop').classList.toggle('on', !!useCrop);
+  $('#stitchInfo').textContent = `${r.links + 1} shots · ` + (r.basic ? 'basic' : `${r.aligned}/${r.links} aligned`) + ` · ${c.width}×${c.height}`;
+}
+
+async function stitch() {
+  if (busy) return;
+  const end = [...shots].reverse().find(s => s.rel);
+  const chain = end ? chainFrom(end) : [];
+  if (chain.length < 2) { toast('No linked sequence. Shoot in → ← ↑ ↓ mode, aligning each shot to the ghost strip.', 3500); return; }
+  busy = true;
+  try {
+    let res = null;
+    try {
+      toast('Loading stitcher…', 60000);
+      await loadCV();
+      res = await smartStitch(chain, t => toast(t, 60000));
+    } catch (e) {
+      console.warn('smart stitch failed', e);
+      toast('Smart stitch unavailable, using basic', 2500);
+      res = await basicStitch(chain);
+    }
+    stitchRes = res; cropOn = true;
+    await showStitch();
+    if (!res.basic) toast(res.aligned === res.links ? 'All seams feature-aligned' : `${res.links - res.aligned} seam(s) used overlap guess (low texture)`, 2500);
+    openSheet('#stitchView');
+  } finally { busy = false; }
 }
 
 /* ---------- wiring ---------- */
@@ -471,6 +768,7 @@ $('#bCloseTray').onclick = () => closeSheet('#tray');
 $('#bSaveAll').onclick = () => shots.length ? saveFiles(shots.map(s => ({blob: s.blob, name: fname(s)}))) : toast('Nothing to save');
 $('#bStitch').onclick = () => { closeSheet('#tray'); stitch(); };
 $('#bCloseStitch').onclick = () => closeSheet('#stitchView');
+$('#bCrop').onclick = () => { cropOn = !cropOn; showStitch(); };
 $('#bSaveStitch').onclick = () => stitchBlob && saveFiles([{blob: stitchBlob, name: `ghostcam_${stamp()}_stitch.jpg`}]);
 let clearArm = 0;
 $('#bClear').onclick = () => {
